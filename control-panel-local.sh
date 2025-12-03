@@ -47,7 +47,8 @@ echo -e "${GREEN}[2/20] Installing required packages...${NC}"
 apt install -y curl wget git gnupg lsb-release ca-certificates apt-transport-https \
     software-properties-common ufw nginx \
     postgresql postgresql-contrib redis-server build-essential \
-    python3 python3-pip python3-venv dos2unix docker.io docker-compose
+    python3 python3-pip python3-venv dos2unix docker.io docker-compose \
+    libssl-dev pkg-config
 
 # Install Node.js 20.x
 echo -e "${GREEN}[3/20] Installing Node.js...${NC}"
@@ -64,13 +65,16 @@ systemctl start docker
 systemctl enable docker
 usermod -aG docker www-data
 
-# Configure PostgreSQL
+# Místo aktuálního kódu použij:
 echo -e "${GREEN}[5/20] Configuring PostgreSQL...${NC}"
-sudo -u postgres psql -c "CREATE DATABASE gamepanel_control;"
 sudo -u postgres psql -c "CREATE USER panel_admin WITH PASSWORD '$DB_PASSWORD';"
 sudo -u postgres psql -c "ALTER USER panel_admin WITH SUPERUSER;"
-sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE gamepanel_control TO panel_admin;"
+sudo -u postgres psql -c "CREATE DATABASE gamepanel_control OWNER panel_admin;"
 sudo -u postgres psql -d gamepanel_control -c "CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\";"
+
+# Po verify installations přidej:
+echo -e "${GREEN}Installing TypeScript globally...${NC}"
+npm install -g typescript ts-node
 
 # Configure Redis
 echo -e "${GREEN}[6/20] Configuring Redis...${NC}"
@@ -536,7 +540,189 @@ npx prisma generate
 
 # Create source directory structure (stejné jako předtím, ale upravíme server.ts pro localhost)
 mkdir -p src/{controllers,middleware,services,routes,utils,sockets,types}
+# Po mkdir -p src/{controllers,middleware,services,routes,utils,sockets,types}
+# Přidej:
+mkdir -p src/{controllers,middleware,services,routes,utils,sockets,types}
+cd /var/www/gamepanel/control-panel/backend
+# Vytvoř základní middleware
+cat > src/middleware/auth.ts <<'EOF'
+import { Request, Response, NextFunction } from 'express';
+import jwt from 'jsonwebtoken';
 
+export const authMiddleware = (req: Request, res: Response, next: NextFunction) => {
+  const token = req.header('Authorization')?.replace('Bearer ', '');
+  
+  if (!token) {
+    return res.status(401).json({ error: 'No token provided' });
+  }
+  
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET!);
+    (req as any).user = decoded;
+    next();
+  } catch (error) {
+    return res.status(401).json({ error: 'Invalid token' });
+  }
+};
+EOF
+
+cat > src/middleware/errorHandler.ts <<'EOF'
+import { Request, Response, NextFunction } from 'express';
+
+export const errorHandler = (
+  err: any,
+  req: Request,
+  res: Response,
+  next: NextFunction
+) => {
+  console.error(err.stack);
+  
+  const statusCode = err.statusCode || 500;
+  const message = err.message || 'Internal Server Error';
+  
+  res.status(statusCode).json({
+    success: false,
+    error: message,
+    stack: process.env.NODE_ENV === 'development' ? err.stack : undefined
+  });
+};
+EOF
+
+cat > src/utils/logger.ts <<'EOF'
+import winston from 'winston';
+import DailyRotateFile from 'winston-daily-rotate-file';
+
+const { combine, timestamp, printf, colorize, json } = winston.format;
+
+const logFormat = printf(({ level, message, timestamp }) => {
+  return `${timestamp} ${level}: ${message}`;
+});
+
+export const logger = winston.createLogger({
+  level: process.env.LOG_LEVEL || 'info',
+  format: combine(
+    timestamp(),
+    logFormat
+  ),
+  transports: [
+    new winston.transports.Console({
+      format: combine(colorize(), logFormat)
+    }),
+    new DailyRotateFile({
+      filename: process.env.LOG_FILE || 'logs/app-%DATE%.log',
+      datePattern: 'YYYY-MM-DD',
+      maxFiles: '30d'
+    }),
+    new DailyRotateFile({
+      filename: process.env.ERROR_LOG_FILE || 'logs/error-%DATE%.log',
+      datePattern: 'YYYY-MM-DD',
+      level: 'error',
+      maxFiles: '30d'
+    })
+  ]
+});
+EOF
+# Auth routes
+cat > src/routes/auth.routes.ts <<'EOF'
+import { Router } from 'express';
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
+import { PrismaClient } from '@prisma/client';
+
+const router = Router();
+const prisma = new PrismaClient();
+
+router.post('/login', async (req, res) => {
+  const { email, password } = req.body;
+  
+  try {
+    const user = await prisma.user.findUnique({
+      where: { email }
+    });
+    
+    if (!user || !(await bcrypt.compare(password, user.password))) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    
+    const token = jwt.sign(
+      { id: user.id, email: user.email, role: user.role },
+      process.env.JWT_SECRET!,
+      { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
+    );
+    
+    res.json({
+      token,
+      user: {
+        id: user.id,
+        email: user.email,
+        username: user.username,
+        role: user.role,
+        firstName: user.firstName,
+        lastName: user.lastName
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Login failed' });
+  }
+});
+
+router.post('/register', async (req, res) => {
+  // Simplified registration for local
+  const { email, password, username } = req.body;
+  
+  try {
+    const hashedPassword = await bcrypt.hash(password, 12);
+    
+    const user = await prisma.user.create({
+      data: {
+        email,
+        username,
+        password: hashedPassword,
+        role: 'USER'
+      }
+    });
+    
+    const token = jwt.sign(
+      { id: user.id, email: user.email, role: user.role },
+      process.env.JWT_SECRET!,
+      { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
+    );
+    
+    res.json({
+      token,
+      user: {
+        id: user.id,
+        email: user.email,
+        username: user.username,
+        role: user.role
+      }
+    });
+  } catch (error) {
+    res.status(400).json({ error: 'Registration failed' });
+  }
+});
+
+export default router;
+EOF
+
+# Server routes
+cat > src/routes/server.routes.ts <<'EOF'
+import { Router } from 'express';
+
+const router = Router();
+
+router.get('/', (req, res) => {
+  res.json({ message: 'Servers endpoint' });
+});
+
+router.post('/', (req, res) => {
+  res.json({ message: 'Create server' });
+});
+
+export default router;
+EOF
+
+# Similar for other routes - vytvoř zjednodušené verze
 # Create all the source files (stejné jako předtím, ale upravíme některé pro localhost)
 # ZDE VLOŽ VŠECHNY SOUBORY Z PŘEDCHOZÍHO OPRAVENÉHO SKRIPTU (WorkerManager.ts, file.routes.ts, backup.routes.ts, atd.)
 # Pro stručnost zde nekopíruji všechny soubory, ale použiju tvůj původní kód s úpravami pro localhost
@@ -713,9 +899,16 @@ httpServer.listen(PORT as number, HOST, () => {
 
 export { io, prisma, workerManager };
 EOF
+# Před "npm run build" přidej:
+echo -e "${GREEN}[9/20] Installing backend dependencies...${NC}"
+cd /var/www/gamepanel/control-panel/backend
+npm install
+
+echo -e "${GREEN}[9.5/20] Generating Prisma client...${NC}"
+npx prisma generate
 
 # Build backend
-echo -e "${GREEN}[9/20] Building backend...${NC}"
+echo -e "${GREEN}[9.8/20] Building backend...${NC}"
 npm run build
 
 # Create systemd service for backend
@@ -1177,7 +1370,7 @@ systemctl restart nginx
 # Apply database migrations
 echo -e "${GREEN}[12/20] Applying database migrations...${NC}"
 cd /var/www/gamepanel/control-panel/backend
-npx prisma migrate dev --name init
+npx prisma db push --accept-data-loss
 
 # Create admin user
 echo -e "${GREEN}[13/20] Creating admin user...${NC}"
@@ -1211,6 +1404,9 @@ async function createAdmin() {
 
 createAdmin().catch(console.error).finally(() => prisma.\$disconnect());
 "
+# Po vytvoření admin usera přidej:
+systemctl restart gamepanel-control
+sleep 5
 
 # Create local node in database
 echo -e "${GREEN}[14/20] Creating local node in database...${NC}"
@@ -1550,7 +1746,22 @@ echo "To remove: docker rm \$SERVER_NAME"
 EOF
 
 chmod +x /var/www/gamepanel/scripts/create-test-server.sh
+# Přidej po řádku 1400:
+echo -e "${GREEN}Checking services...${NC}"
+sleep 3
 
+if systemctl is-active --quiet gamepanel-control; then
+    echo -e "✓ Control Panel service is running"
+else
+    echo -e "${RED}✗ Control Panel service failed to start${NC}"
+    journalctl -u gamepanel-control --no-pager -n 20
+fi
+
+if systemctl is-active --quiet gamepanel-worker; then
+    echo -e "✓ Worker service is running"
+else
+    echo -e "${YELLOW}⚠ Worker service may need manual configuration${NC}"
+fi
 # Final message
 echo -e "${BLUE}========================================${NC}"
 echo -e "${GREEN}🎉 Local Game Panel Installation Complete!${NC}"
